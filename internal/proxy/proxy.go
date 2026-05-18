@@ -202,3 +202,8 @@ func coerceValue(val any, typeName string) (any, error) {
 	}
 	return nil, fmt.Errorf("unknown type %q", typeName)
 }
+
+// JSONToBinaryPublic is the exported version for benchmarking
+func JSONToBinaryPublic(jsonBody []byte, sc *schema.Schema) ([]byte, error) {
+	return jsonToBinary(jsonBody, sc)
+}
