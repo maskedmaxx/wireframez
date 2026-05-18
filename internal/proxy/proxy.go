@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/maskedmaxx/wireframez/internal/codec"
@@ -17,10 +18,17 @@ import (
 	"github.com/maskedmaxx/wireframez/internal/schema"
 )
 
-// Proxy is a transcoding reverse proxy
+// Target represents a registered backend
+type Target struct {
+	SchemaName string `json:"schema_name"`
+	URL        string `json:"url"`
+}
+
+// Proxy is a transcoding reverse proxy with dynamic target registration
 type Proxy struct {
 	store   *schema.Store
 	targets map[string]*url.URL
+	mu      sync.RWMutex
 }
 
 // NewProxy creates a new transcoding proxy
@@ -31,22 +39,41 @@ func NewProxy(store *schema.Store) *Proxy {
 	}
 }
 
-// RegisterTarget tells the proxy where to forward requests for a given schema name
+// RegisterTarget registers a backend target for a schema
 func (p *Proxy) RegisterTarget(schemaName, targetURL string) error {
 	u, err := url.Parse(targetURL)
 	if err != nil {
 		return fmt.Errorf("parse target url: %w", err)
 	}
+	p.mu.Lock()
 	p.targets[schemaName] = u
+	p.mu.Unlock()
 	return nil
 }
 
-// ServeHTTP handles incoming requests
+// DeregisterTarget removes a backend target
+func (p *Proxy) DeregisterTarget(schemaName string) {
+	p.mu.Lock()
+	delete(p.targets, schemaName)
+	p.mu.Unlock()
+}
+
+// ListTargets returns all registered targets
+func (p *Proxy) ListTargets() []Target {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	targets := make([]Target, 0, len(p.targets))
+	for name, u := range p.targets {
+		targets = append(targets, Target{SchemaName: name, URL: u.String()})
+	}
+	return targets
+}
+
+// ServeHTTP handles incoming proxy requests
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metrics.ActiveConnections.Inc()
 	defer metrics.ActiveConnections.Dec()
 
-	// expect path: /<schema-name>/...
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
 	if len(parts) == 0 || parts[0] == "" {
 		http.Error(w, "missing schema name in path", http.StatusBadRequest)
@@ -55,17 +82,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	schemaName := parts[0]
 
-	// look up schema with timing
-	schemaStart := time.Now()
-	sc, err := p.store.GetLatest(schemaName)
-	metrics.SchemaLookupDuration.Observe(time.Since(schemaStart).Seconds())
-	if err != nil {
-		http.Error(w, fmt.Sprintf("schema not found: %v", err), http.StatusNotFound)
-		metrics.RequestsTotal.WithLabelValues(schemaName, "404").Inc()
-		return
-	}
-
-	// read request body
+	// read body first so we can use it for both passthrough and transcoding
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read body failed", http.StatusInternalServerError)
@@ -74,42 +91,60 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// transcode JSON -> binary if there's a body
-	var transcoded []byte
-	if len(body) > 0 {
-		metrics.PayloadSizeJSON.WithLabelValues(schemaName).Observe(float64(len(body)))
-
-		transcodeStart := time.Now()
-		transcoded, err = jsonToBinary(body, sc)
-		metrics.TranscodingDuration.WithLabelValues(schemaName).Observe(time.Since(transcodeStart).Seconds())
-
-		if err != nil {
-			http.Error(w, fmt.Sprintf("transcode failed: %v", err), http.StatusBadRequest)
-			metrics.RequestsTotal.WithLabelValues(schemaName, "400").Inc()
-			return
-		}
-
-		metrics.PayloadSizeBinary.WithLabelValues(schemaName).Observe(float64(len(transcoded)))
-		metrics.CompressionRatio.WithLabelValues(schemaName).Observe(
-			float64(len(transcoded)) / float64(len(body)),
-		)
-	}
+	// look up schema — if not found, passthrough mode
+	schemaStart := time.Now()
+	sc, schemaErr := p.store.GetLatest(schemaName)
+	metrics.SchemaLookupDuration.Observe(time.Since(schemaStart).Seconds())
 
 	// find target
-	target, ok := p.targets[schemaName]
-	if !ok {
+	p.mu.RLock()
+	target, hasTarget := p.targets[schemaName]
+	p.mu.RUnlock()
+
+	if !hasTarget {
 		http.Error(w, fmt.Sprintf("no target registered for schema %q", schemaName), http.StatusBadGateway)
 		metrics.RequestsTotal.WithLabelValues(schemaName, "502").Inc()
 		return
 	}
 
-	// forward request
+	var forwardBody []byte
+
+	if schemaErr != nil {
+		// passthrough — no schema registered, forward JSON as-is
+		forwardBody = body
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("X-Wireframez-Mode", "passthrough")
+	} else {
+		// transcode JSON -> binary
+		if len(body) > 0 {
+			metrics.PayloadSizeJSON.WithLabelValues(schemaName).Observe(float64(len(body)))
+
+			transcodeStart := time.Now()
+			transcoded, err := jsonToBinary(body, sc)
+			metrics.TranscodingDuration.WithLabelValues(schemaName).Observe(time.Since(transcodeStart).Seconds())
+
+			if err != nil {
+				// transcode failed — fallback to passthrough
+				forwardBody = body
+				r.Header.Set("Content-Type", "application/json")
+				r.Header.Set("X-Wireframez-Mode", "passthrough-fallback")
+			} else {
+				forwardBody = transcoded
+				metrics.PayloadSizeBinary.WithLabelValues(schemaName).Observe(float64(len(transcoded)))
+				metrics.CompressionRatio.WithLabelValues(schemaName).Observe(
+					float64(len(transcoded)) / float64(len(body)),
+				)
+				r.Header.Set("Content-Type", "application/octet-stream")
+				r.Header.Set("X-Wireframez-Mode", "transcoded")
+				r.Header.Set("X-Wireframez-Schema", schemaName)
+				r.Header.Set("X-Wireframez-Version", strconv.Itoa(sc.Version))
+			}
+		}
+	}
+
 	reverseProxy := httputil.NewSingleHostReverseProxy(target)
-	r.Body = io.NopCloser(bytes.NewReader(transcoded))
-	r.ContentLength = int64(len(transcoded))
-	r.Header.Set("Content-Type", "application/octet-stream")
-	r.Header.Set("X-Wireframez-Schema", schemaName)
-	r.Header.Set("X-Wireframez-Version", strconv.Itoa(sc.Version))
+	r.Body = io.NopCloser(bytes.NewReader(forwardBody))
+	r.ContentLength = int64(len(forwardBody))
 
 	metrics.RequestsTotal.WithLabelValues(schemaName, "200").Inc()
 	reverseProxy.ServeHTTP(w, r)
@@ -146,17 +181,24 @@ func jsonToBinary(jsonBody []byte, sc *schema.Schema) ([]byte, error) {
 		})
 	}
 
-	return codec.Encode(fields)
+	// embed schema version in the wire header
+	return codec.EncodeWithVersion(fields, uint16(sc.Version))
 }
 
 // BinaryToJSON converts wireframez binary back to JSON
 func BinaryToJSON(data []byte) ([]byte, error) {
-	fields, err := codec.Decode(data)
+	// validate magic bytes first
+	if !codec.IsWireframezPayload(data) {
+		return nil, fmt.Errorf("not a wireframez payload")
+	}
+
+	header, fields, err := codec.DecodeWithHeader(data)
 	if err != nil {
 		return nil, err
 	}
 
-	out := make(map[string]any, len(fields))
+	out := make(map[string]any, len(fields)+1)
+	out["_schema_version"] = header.SchemaVersion
 	for _, f := range fields {
 		out[f.Name] = f.Value
 	}

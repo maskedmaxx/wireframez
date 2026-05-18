@@ -1,0 +1,31 @@
+[
+  {
+    "name": "user",
+    "fields": [
+      { "name": "id", "type": "int32" },
+      { "name": "name", "type": "string" },
+      { "name": "email", "type": "string" },
+      { "name": "score", "type": "float64" },
+      { "name": "active", "type": "bool" }
+    ]
+  },
+  {
+    "name": "order",
+    "fields": [
+      { "name": "id", "type": "int64" },
+      { "name": "user_id", "type": "int32" },
+      { "name": "total", "type": "float64" },
+      { "name": "status", "type": "string" },
+      { "name": "paid", "type": "bool" }
+    ]
+  },
+  {
+    "name": "event",
+    "fields": [
+      { "name": "id", "type": "int64" },
+      { "name": "type", "type": "string" },
+      { "name": "payload", "type": "string" },
+      { "name": "timestamp", "type": "int64" }
+    ]
+  }
+]

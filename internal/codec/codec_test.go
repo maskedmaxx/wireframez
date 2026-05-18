@@ -1,8 +1,8 @@
 package codec
 
 import (
-	"testing"
 	"fmt"
+	"testing"
 )
 
 func TestEncodeDecodeRoundtrip(t *testing.T) {
@@ -13,7 +13,7 @@ func TestEncodeDecodeRoundtrip(t *testing.T) {
 		{Name: "active", Type: TypeBool, Value: true},
 	}
 
-	encoded, err := Encode(original)
+	encoded, err := EncodeWithVersion(original, 3)
 	if err != nil {
 		t.Fatalf("encode failed: %v", err)
 	}
@@ -21,9 +21,28 @@ func TestEncodeDecodeRoundtrip(t *testing.T) {
 	fmt.Printf("JSON equivalent would be ~%d bytes\n", jsonSize(original))
 	fmt.Printf("Binary encoded:          %d bytes\n", len(encoded))
 
-	decoded, err := Decode(encoded)
+	// verify magic bytes
+	if !IsWireframezPayload(encoded) {
+		t.Fatal("missing magic bytes")
+	}
+
+	// decode header
+	header, err := DecodeHeader(encoded)
+	if err != nil {
+		t.Fatalf("decode header: %v", err)
+	}
+	if header.SchemaVersion != 3 {
+		t.Errorf("expected schema version 3, got %d", header.SchemaVersion)
+	}
+	t.Logf("wire header: schema_version=%d", header.SchemaVersion)
+
+	// full decode
+	header2, decoded, err := DecodeWithHeader(encoded)
 	if err != nil {
 		t.Fatalf("decode failed: %v", err)
+	}
+	if header2.SchemaVersion != 3 {
+		t.Errorf("schema version mismatch")
 	}
 
 	for i, f := range decoded {
@@ -32,17 +51,16 @@ func TestEncodeDecodeRoundtrip(t *testing.T) {
 		}
 	}
 
-	fmt.Println("all fields round-tripped correctly")
+	fmt.Println("all fields round-tripped correctly with version header")
 }
 
-// rough estimate of what JSON would cost for the same data
 func jsonSize(fields []Field) int {
-	size := 2 // {}
+	size := 2
 	for i, f := range fields {
 		if i > 0 {
-			size++ // comma
+			size++
 		}
-		size += len(f.Name) + 3 // "name":
+		size += len(f.Name) + 3
 		switch f.Type {
 		case TypeInt32, TypeInt64:
 			size += 4

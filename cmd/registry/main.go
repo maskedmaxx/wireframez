@@ -29,6 +29,14 @@ func main() {
 	}
 	defer store.Close()
 
+	// seed schemas from file if provided
+	seedPath := os.Getenv("WIREFRAMEZ_SEED_FILE")
+	if seedPath != "" {
+    	if err := schema.SeedFromFile(store, seedPath); err != nil {
+        	log.Printf("warning: seed failed: %v", err)
+    	}
+	}
+
 	mux := http.NewServeMux()
 
 	// POST /schemas — register a new schema

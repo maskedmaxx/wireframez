@@ -6,7 +6,7 @@ import (
 	"math"
 )
 
-// Type tags — one byte that identifies what type a field is
+// Type tags
 const (
 	TypeInt32   byte = 0x01
 	TypeInt64   byte = 0x02
@@ -17,6 +17,15 @@ const (
 	TypeNull    byte = 0x07
 )
 
+// WireHeader is prepended to every encoded payload
+// Layout: [magic: 2 bytes] [version: 2 bytes] [schema_version: 2 bytes]
+const (
+	MagicByte0 byte = 0x57 // 'W'
+	MagicByte1 byte = 0x5A // 'Z'
+	WireVersion     = uint16(1)
+	HeaderSize      = 6
+)
+
 // Field represents a single key-value pair in a payload
 type Field struct {
 	Name  string
@@ -24,23 +33,35 @@ type Field struct {
 	Value any
 }
 
-// Encode takes a slice of fields and returns the binary representation
+// Header contains wire format metadata
+type Header struct {
+	SchemaVersion uint16
+}
+
+// Encode takes a slice of fields and a schema version, returns binary representation
 func Encode(fields []Field) ([]byte, error) {
-	buf := []byte{}
+	return EncodeWithVersion(fields, 0)
+}
+
+// EncodeWithVersion encodes fields with an explicit schema version in the header
+func EncodeWithVersion(fields []Field, schemaVersion uint16) ([]byte, error) {
+	// write header
+	buf := make([]byte, HeaderSize)
+	buf[0] = MagicByte0
+	buf[1] = MagicByte1
+	binary.BigEndian.PutUint16(buf[2:4], WireVersion)
+	binary.BigEndian.PutUint16(buf[4:6], schemaVersion)
 
 	// write field count
 	buf = append(buf, byte(len(fields)))
 
 	for _, f := range fields {
-		// write type tag
 		buf = append(buf, f.Type)
 
-		// write field name (1 byte length prefix + name bytes)
 		name := []byte(f.Name)
 		buf = append(buf, byte(len(name)))
 		buf = append(buf, name...)
 
-		// write value
 		encoded, err := encodeValue(f.Type, f.Value)
 		if err != nil {
 			return nil, err
@@ -51,42 +72,69 @@ func Encode(fields []Field) ([]byte, error) {
 	return buf, nil
 }
 
+// DecodeHeader reads just the wire header without decoding fields
+func DecodeHeader(buf []byte) (*Header, error) {
+	if len(buf) < HeaderSize {
+		return nil, errors.New("buffer too short for header")
+	}
+	if buf[0] != MagicByte0 || buf[1] != MagicByte1 {
+		return nil, errors.New("invalid magic bytes: not a wireframez payload")
+	}
+	return &Header{
+		SchemaVersion: binary.BigEndian.Uint16(buf[4:6]),
+	}, nil
+}
+
 // Decode takes a binary buffer and returns the fields
 func Decode(buf []byte) ([]Field, error) {
-	if len(buf) == 0 {
-		return nil, errors.New("empty buffer")
+	_, fields, err := DecodeWithHeader(buf)
+	return fields, err
+}
+
+// DecodeWithHeader returns both the header and fields
+func DecodeWithHeader(buf []byte) (*Header, []Field, error) {
+	if len(buf) < HeaderSize+1 {
+		return nil, nil, errors.New("buffer too short")
 	}
 
-	fieldCount := int(buf[0])
-	pos := 1
-	fields := make([]Field, 0, fieldCount)
+	header, err := DecodeHeader(buf)
+	if err != nil {
+		return nil, nil, err
+	}
 
+	pos := HeaderSize
+	fieldCount := int(buf[pos])
+	pos++
+
+	fields := make([]Field, 0, fieldCount)
 	for i := 0; i < fieldCount; i++ {
 		if pos >= len(buf) {
-			return nil, errors.New("unexpected end of buffer")
+			return nil, nil, errors.New("unexpected end of buffer")
 		}
 
-		// read type tag
 		typeTag := buf[pos]
 		pos++
 
-		// read field name
 		nameLen := int(buf[pos])
 		pos++
 		name := string(buf[pos : pos+nameLen])
 		pos += nameLen
 
-		// read value
 		value, bytesRead, err := decodeValue(typeTag, buf[pos:])
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		pos += bytesRead
 
 		fields = append(fields, Field{Name: name, Type: typeTag, Value: value})
 	}
 
-	return fields, nil
+	return header, fields, nil
+}
+
+// IsWireframezPayload checks if a buffer starts with the wireframez magic bytes
+func IsWireframezPayload(buf []byte) bool {
+	return len(buf) >= 2 && buf[0] == MagicByte0 && buf[1] == MagicByte1
 }
 
 func encodeValue(typeTag byte, value any) ([]byte, error) {
@@ -141,7 +189,6 @@ func encodeValue(typeTag byte, value any) ([]byte, error) {
 			return nil, errors.New("expected string")
 		}
 		strBytes := []byte(v)
-		// 4 byte length prefix + string bytes
 		lenBuf := make([]byte, 4)
 		binary.BigEndian.PutUint32(lenBuf, uint32(len(strBytes)))
 		return append(lenBuf, strBytes...), nil
