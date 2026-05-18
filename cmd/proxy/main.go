@@ -8,6 +8,7 @@ import (
 
 	"github.com/maskedmaxx/wireframez/internal/proxy"
 	"github.com/maskedmaxx/wireframez/internal/schema"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -24,14 +25,20 @@ func main() {
 
 	p := proxy.NewProxy(store)
 
-	// example: forward /user/... to a mock backend on :9090
 	if err := p.RegisterTarget("user", "http://localhost:9090"); err != nil {
 		log.Fatalf("register target: %v", err)
 	}
 
+	// metrics endpoint
+	http.Handle("/metrics", promhttp.Handler())
+
+	// proxy handler
+	http.Handle("/", p)
+
 	addr := ":8080"
 	fmt.Printf("wireframez proxy listening on %s\n", addr)
-	if err := http.ListenAndServe(addr, p); err != nil {
+	fmt.Printf("metrics available at http://localhost%s/metrics\n", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("server: %v", err)
 	}
 }

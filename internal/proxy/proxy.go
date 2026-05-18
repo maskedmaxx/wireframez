@@ -10,15 +10,17 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/maskedmaxx/wireframez/internal/codec"
+	"github.com/maskedmaxx/wireframez/internal/metrics"
 	"github.com/maskedmaxx/wireframez/internal/schema"
 )
 
 // Proxy is a transcoding reverse proxy
 type Proxy struct {
 	store   *schema.Store
-	targets map[string]*url.URL // route name -> backend URL
+	targets map[string]*url.URL
 }
 
 // NewProxy creates a new transcoding proxy
@@ -41,18 +43,25 @@ func (p *Proxy) RegisterTarget(schemaName, targetURL string) error {
 
 // ServeHTTP handles incoming requests
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	metrics.ActiveConnections.Inc()
+	defer metrics.ActiveConnections.Dec()
+
 	// expect path: /<schema-name>/...
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
 	if len(parts) == 0 || parts[0] == "" {
 		http.Error(w, "missing schema name in path", http.StatusBadRequest)
+		metrics.RequestsTotal.WithLabelValues("unknown", "400").Inc()
 		return
 	}
 	schemaName := parts[0]
 
-	// look up schema
+	// look up schema with timing
+	schemaStart := time.Now()
 	sc, err := p.store.GetLatest(schemaName)
+	metrics.SchemaLookupDuration.Observe(time.Since(schemaStart).Seconds())
 	if err != nil {
 		http.Error(w, fmt.Sprintf("schema not found: %v", err), http.StatusNotFound)
+		metrics.RequestsTotal.WithLabelValues(schemaName, "404").Inc()
 		return
 	}
 
@@ -60,6 +69,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read body failed", http.StatusInternalServerError)
+		metrics.RequestsTotal.WithLabelValues(schemaName, "500").Inc()
 		return
 	}
 	defer r.Body.Close()
@@ -67,17 +77,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// transcode JSON -> binary if there's a body
 	var transcoded []byte
 	if len(body) > 0 {
+		metrics.PayloadSizeJSON.WithLabelValues(schemaName).Observe(float64(len(body)))
+
+		transcodeStart := time.Now()
 		transcoded, err = jsonToBinary(body, sc)
+		metrics.TranscodingDuration.WithLabelValues(schemaName).Observe(time.Since(transcodeStart).Seconds())
+
 		if err != nil {
 			http.Error(w, fmt.Sprintf("transcode failed: %v", err), http.StatusBadRequest)
+			metrics.RequestsTotal.WithLabelValues(schemaName, "400").Inc()
 			return
 		}
+
+		metrics.PayloadSizeBinary.WithLabelValues(schemaName).Observe(float64(len(transcoded)))
+		metrics.CompressionRatio.WithLabelValues(schemaName).Observe(
+			float64(len(transcoded)) / float64(len(body)),
+		)
 	}
 
 	// find target
 	target, ok := p.targets[schemaName]
 	if !ok {
 		http.Error(w, fmt.Sprintf("no target registered for schema %q", schemaName), http.StatusBadGateway)
+		metrics.RequestsTotal.WithLabelValues(schemaName, "502").Inc()
 		return
 	}
 
@@ -89,10 +111,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Set("X-Wireframez-Schema", schemaName)
 	r.Header.Set("X-Wireframez-Version", strconv.Itoa(sc.Version))
 
+	metrics.RequestsTotal.WithLabelValues(schemaName, "200").Inc()
 	reverseProxy.ServeHTTP(w, r)
 }
 
-// jsonToBinary converts a JSON payload to wireframez binary format using the schema
+// jsonToBinary converts a JSON payload to wireframez binary format
 func jsonToBinary(jsonBody []byte, sc *schema.Schema) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(jsonBody, &raw); err != nil {
@@ -103,7 +126,7 @@ func jsonToBinary(jsonBody []byte, sc *schema.Schema) ([]byte, error) {
 	for _, fd := range sc.Fields {
 		val, ok := raw[fd.Name]
 		if !ok {
-			continue // skip missing fields
+			continue
 		}
 
 		typeTag, err := typeTagFromString(fd.Type)
@@ -111,7 +134,6 @@ func jsonToBinary(jsonBody []byte, sc *schema.Schema) ([]byte, error) {
 			return nil, err
 		}
 
-		// JSON numbers are float64 by default — cast to the right type
 		val, err = coerceValue(val, fd.Type)
 		if err != nil {
 			return nil, fmt.Errorf("field %q: %w", fd.Name, err)
@@ -127,7 +149,7 @@ func jsonToBinary(jsonBody []byte, sc *schema.Schema) ([]byte, error) {
 	return codec.Encode(fields)
 }
 
-// BinaryToJSON converts a wireframez binary payload back to JSON
+// BinaryToJSON converts wireframez binary back to JSON
 func BinaryToJSON(data []byte) ([]byte, error) {
 	fields, err := codec.Decode(data)
 	if err != nil {
@@ -140,6 +162,11 @@ func BinaryToJSON(data []byte) ([]byte, error) {
 	}
 
 	return json.Marshal(out)
+}
+
+// JSONToBinaryPublic is the exported version for benchmarking
+func JSONToBinaryPublic(jsonBody []byte, sc *schema.Schema) ([]byte, error) {
+	return jsonToBinary(jsonBody, sc)
 }
 
 func typeTagFromString(t string) (byte, error) {
@@ -201,9 +228,4 @@ func coerceValue(val any, typeName string) (any, error) {
 		return s, nil
 	}
 	return nil, fmt.Errorf("unknown type %q", typeName)
-}
-
-// JSONToBinaryPublic is the exported version for benchmarking
-func JSONToBinaryPublic(jsonBody []byte, sc *schema.Schema) ([]byte, error) {
-	return jsonToBinary(jsonBody, sc)
 }
