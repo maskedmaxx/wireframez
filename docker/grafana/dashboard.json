@@ -1,0 +1,42 @@
+{
+  "title": "Wireframez",
+  "uid": "wireframez",
+  "schemaVersion": 36,
+  "panels": [
+    {
+      "title": "Requests Per Second",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "rate(wireframez_requests_total[1m])", "legendFormat": "{{schema}} {{status}}" }]
+    },
+    {
+      "title": "Active Connections",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "wireframez_active_connections" }]
+    },
+    {
+      "title": "Transcoding Latency (p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "histogram_quantile(0.99, rate(wireframez_transcoding_duration_seconds_bucket[1m]))", "legendFormat": "{{schema}}" }]
+    },
+    {
+      "title": "Compression Ratio",
+      "type": "gauge",
+      "gridPos": { "x": 12, "y": 8, "w": 4, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "histogram_quantile(0.50, rate(wireframez_compression_ratio_bucket[1m]))" }]
+    },
+    {
+      "title": "Schema Lookup Latency (p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "histogram_quantile(0.99, rate(wireframez_schema_lookup_duration_seconds_bucket[1m]))", "legendFormat": "p99" }]
+    }
+  ]
+}
